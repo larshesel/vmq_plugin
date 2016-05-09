@@ -20,9 +20,6 @@
 %% API
 -export([start_link/0,
          stop/0
-         %% disable_plugin/1,
-         %% disable_module_plugin/3,
-         %% disable_module_plugin/4
         ]).
 
 %% runlevels
@@ -67,7 +64,17 @@
           config_file,
           %% proplist of plugins, most recent added first.
           plugins=[],
+          runlevel=none,
           deferred_calls=[]}).
+
+-type plugin_runlevel() :: system
+                         | user.
+-type runlevel() :: none
+                  | plugin_runlevel().
+
+-define(RUNLEVELS, [{none,   0} %% the runlevel without any running plugins
+                   ,{system, 1}
+                   ,{user,   2}]).
 
 %% -type plugin() :: atom()
 %%                 | {atom(),
@@ -98,13 +105,13 @@ stop() ->
 register_app_plugin(Plugin, Level) ->
     register_app_plugin(Plugin, [], Level).
 
--spec register_app_plugin(atom(), [string()], atom()) -> ok | {error, _}.
+-spec register_app_plugin(atom(), [string()], plugin_runlevel()) -> ok | {error, _}.
 register_app_plugin(Plugin, Paths, Level) when
       is_atom(Plugin) and is_list(Paths) and is_atom(Level)  ->
     gen_server:call(?MODULE, {register_app_plugin, Plugin,
                               #{level => Level, paths => Paths}}, infinity).
 
--spec register_module_plugin(atom(), atom(), non_neg_integer(), atom()) ->
+-spec register_module_plugin(atom(), atom(), non_neg_integer(), plugin_runlevel()) ->
     ok | {error, _}.
 register_module_plugin(Module, Fun, Arity, Level) ->
     register_module_plugin(Fun, Module, Fun, Arity, Level).
@@ -120,23 +127,7 @@ register_module_plugin(HookName, Module, Fun, Arity, Level) when
 dump_plugins() ->
     gen_server:call(?MODULE, dump_plugins).
 
-%% -spec disable_module_plugin(atom(), atom(), non_neg_integer()) ->
-%%     ok | {error, _}.
-%% disable_module_plugin(Module, Fun, Arity) ->
-%%     disable_module_plugin(Fun, Module, Fun, Arity).
-
-%% -spec disable_module_plugin(atom(), atom(), atom(), non_neg_integer()) ->
-%%     ok | {error, _}.
-%% disable_module_plugin(HookName, Module, Fun, Arity) when
-%%       is_atom(HookName) and is_atom(Module)
-%%       and is_atom(Fun) and (Arity >= 0) ->
-%%     disable_plugin({HookName, Module, Fun, Arity}).
-
-%% -spec disable_plugin(plugin()) -> ok | {error, _}.
-%% disable_plugin(Plugin) when is_atom(Plugin) or is_tuple(Plugin) ->
-%%     gen_server:call(?MODULE, {disable_plugin, Plugin}, infinity).
-
--spec goto_runlevel(atom()) -> ok | {error, _}.
+-spec goto_runlevel(runlevel()) -> ok | {error, _}.
 goto_runlevel(Level) ->
     gen_server:call(?MODULE, {goto_runlevel, Level}, infinity).
 
@@ -158,10 +149,18 @@ goto_runlevel(Level) ->
 init([]) ->
     {ok, PluginDir} = application:get_env(vmq_plugin, plugin_dir),
     {ok, ConfigFileName} = application:get_env(vmq_plugin, plugin_config),
+    VmqSchemaDir = application:get_env(vmq_plugin, default_schema_dir, []),
+
     case filelib:ensure_dir(PluginDir) of
         ok ->
             ConfigFile = filename:join(PluginDir, ConfigFileName),
             Config = read_config(ConfigFile),
+            case clique_config:load_schema(VmqSchemaDir) of
+                {error, schema_files_not_found} ->
+                    lager:debug("couldn't load cuttlefish schema for plugin: ~p", [vmq_plugin]);
+                ok ->
+                    ok
+            end,
             case wait_until_ready(#state{plugin_dir=PluginDir,
                                          config_file=ConfigFile,
                                          plugins=Config}) of
@@ -206,9 +205,14 @@ handle_call({register_app_plugin, Plugin, Opts}, _From,
     PluginKey = {application, Plugin},
     case proplists:get_value(PluginKey, Plugins) of
         undefined ->
-            NewPlugins = [{PluginKey, Opts}| Plugins],
-            write_plugin_config(State#state.config_file, NewPlugins),
-            {reply, ok, State#state{plugins = NewPlugins}};
+            case check_app_plugin(Plugin, Opts) of
+                hooks_ok ->
+                    NewPlugins = group_plugins_by_level([{PluginKey, Opts}| Plugins]),
+                    write_plugin_config(State#state.config_file, NewPlugins),
+                    {reply, ok, State#state{plugins = NewPlugins}};
+                {error, Error} ->
+                    {reply, {error, Error}, State}
+            end;
         _ ->
             {reply, {error, already_registered}, State}
     end;
@@ -217,60 +221,24 @@ handle_call({register_module_plugin, HookName, Module, Fun, Arity, Level},
     PluginKey = {module, HookName, Module, Fun, Arity},
     case proplists:get_value(PluginKey, Plugins) of
         undefined ->
-            NewPlugins = [{PluginKey, Level}|Plugins],
-            write_plugin_config(State#state.config_file, NewPlugins),
-            {reply, ok, State#state{plugins = NewPlugins}};
+            case check_mfa(Module, Fun, Arity) of 
+                plugin_ok ->
+                    NewPlugins = group_plugins_by_level([{PluginKey, Level}|Plugins]),
+                    write_plugin_config(State#state.config_file, NewPlugins),
+                    {reply, ok, State#state{plugins = NewPlugins}};
+                {error, Error} ->
+                    {reply, {error, Error}, State}
+            end;
         _ ->
             {reply, {error, already_registered}, State}
     end;
 handle_call(dump_plugins, _From, #state{plugins = Plugins} = State) ->
     {reply, Plugins, State};
 handle_call({goto_runlevel, Level}, _From, #state{ready=true} = State) ->
-    {Res, State} = goto_runlevel(Level, State),
-    {reply, Res, State};
+    {Res, NewState} = goto_runlevel(Level, State),
+    {reply, Res, NewState};
 handle_call({goto_runlevel, _Level}, _From, State) ->
-    {reply, {error, not_ready}, State};
-
-handle_call(Call, _From, #state{ready=true} = State) ->
-    handle_plugin_call(Call, State);
-handle_call(Call, From, #state{deferred_calls=DeferredCalls} = State) ->
-    {noreply, State#state{deferred_calls=[{Call, From}|DeferredCalls]}}.
-
-handle_plugin_call({enable_plugin, Plugin, Paths}, State) ->
-    case enable_plugin_generic(
-           {application, Plugin, Paths}, State) of
-                {ok, NewState} ->
-            {reply, ok, NewState};
-        {error, _} = E ->
-            {reply, E, State}
-    end;
-handle_plugin_call({enable_module_plugin, HookName, Module, Fun, Arity}, State) ->
-    case enable_plugin_generic(
-           {module, Module, [{hooks, [{HookName, Fun, Arity}]}]}, State) of
-        {ok, NewState} ->
-            {reply, ok, NewState};
-        {error, _} = E ->
-            {reply, E, State}
-    end;
-handle_plugin_call({disable_plugin, PluginKey}, State) ->
-    %% PluginKey is either the Application Name of the Plugin or
-    %% {HookName, ModuleName, Fun, Arity} for Module Plugins
-    case disable_plugin_generic(PluginKey, State) of
-        {ok, NewState} ->
-            case PluginKey of
-                {_, _, _, _} -> ignore;
-                _ -> stop_plugin(PluginKey)
-            end,
-            {reply, ok, NewState};
-        {error, _} = E ->
-            {reply, E, State}
-    end.
-
-handle_deferred_calls(#state{deferred_calls=[{Call, From}|Rest]} = State) ->
-    {reply, Reply, NewState} = handle_plugin_call(Call, State#state{deferred_calls=Rest}),
-    gen_server:reply(From, Reply),
-    handle_deferred_calls(NewState);
-handle_deferred_calls(#state{deferred_calls=[]} = State) -> State.
+    {reply, {error, not_ready}, State}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -329,93 +297,57 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-goto_runlevel(_Level, State) ->
-    {ok, State}.
 
-enable_plugin_generic(Plugin, #state{config_file=ConfigFile} = State) ->
-    case file:consult(ConfigFile) of
-        {ok, [{plugins, Plugins}]} ->
-            case get_new_hooks(Plugin, Plugins) of
-                none -> update_plugins(Plugins, State);
-                {error, _} = E -> E;
-                NewPlugin -> update_plugins(Plugins ++ [NewPlugin], State)
-            end;
-        {error, _} = E -> E
-    end.
+goto_runlevel(TargetLevel, #state{ready = true, runlevel = TargetLevel} = State) ->
+    {ok, State};
+goto_runlevel(TargetLevel, #state{ready = true} = State) ->
+    case plugin_runlevel_diff(TargetLevel, State) of
+        {start, Plugins} -> start_plugins(lists:reverse(Plugins));
+        {stop, Plugins} -> stop_plugins(Plugins)
+    end,
+    compile_hooks(TargetLevel, State#state.plugins),
+    {ok, State#state{runlevel = TargetLevel}}.
 
-get_new_hooks({module, Module, [{hooks, [{H,F,A}]}]} = NewPlugin, OldPlugins) ->
-    case plugins_have_hook({H, Module, F, A}, OldPlugins) of
-        false -> NewPlugin;
-        true -> none
-    end;
-get_new_hooks({application, Name, Opts}, OldPlugins) ->
-    HasAppHook = lists:any(fun({application, N, _}) -> Name =:= N;
-                              (_) -> false
-                           end,
-                           OldPlugins),
-    case HasAppHook of
+start_plugins([]) -> ok;
+start_plugins([{{module, _,_,_,_},_}|T]) ->
+    start_plugins(T);
+start_plugins([{{application, App}, _}|T]) ->
+    ok = start_plugin(App),
+    ok = init_plugin_cli(App),
+    start_plugins(T).
+
+stop_plugins([]) -> ok;
+stop_plugins([{{module, _,_,_,_},_}|T]) ->
+    stop_plugins(T);
+stop_plugins([{{application, _}, _}|T]) ->
+    stop_plugin(T),
+    stop_plugins(T).
+
+plugin_runlevel_diff(TargetLevel, #state{runlevel = CurrLevel, plugins = Plugins}) ->
+    CurrNum = proplists:get_value(CurrLevel, ?RUNLEVELS),
+    TgtNum = proplists:get_value(TargetLevel, ?RUNLEVELS),
+    case CurrNum < TgtNum of
         true ->
-            %% Currently we do note overwrite application plugins.
-            %% They need to be disabled and enabled again.
-            {error, already_enabled};
-        false -> {application, Name, Opts}
+            StartLevels =
+                lists:filter(fun({_Name, Num}) ->
+                                     (CurrNum < Num) and (Num =< TgtNum)
+                             end, ?RUNLEVELS),
+            {start, filter_plugins(StartLevels, Plugins)};
+        _ ->
+            StopLevels = 
+                lists:filter(fun({_Name, Num}) ->
+                                     (TgtNum < Num) and (Num =< CurrNum)
+                             end, ?RUNLEVELS),
+            {stop, filter_plugins(StopLevels, Plugins)}
     end.
 
-plugins_have_hook(Hook, OldPlugins) ->
-    lists:any(
-      fun({H,M,F,A,_}) ->
-              {H,M,F,A} =:= Hook
-      end,
-      extract_hooks(OldPlugins)).
-
-disable_plugin_generic(PluginKey, #state{config_file=ConfigFile} = State) ->
-    case file:consult(ConfigFile) of
-        {ok, [{plugins, Plugins}]} ->
-            case delete_plugin(PluginKey, Plugins) of
-                Plugins -> {error, plugin_not_found};
-                NewPlugins -> update_plugins(NewPlugins, State)
-            end;
-        {error, _} = E ->
-            E
-    end.
-
-delete_plugin(AppName, Plugins) when is_atom(AppName) ->
-    lists:filter(fun({application, N, _}) ->
-                         N =/= AppName;
-                    (_) -> true
-                 end, Plugins);
-delete_plugin({H,M,F,A}, Plugins) ->
-    lists:filtermap(
-      fun({module, Name, Opts}) ->
-              Hooks = proplists:get_value(hooks, Opts, []),
-              RemainingHooks = remove_module_hook({H,M,F,A}, Name, Hooks),
-              case RemainingHooks of
-                  [] -> false;
-                  RemainingHooks ->
-                      NewOpts = lists:keyreplace(hooks, 1, Opts, {hooks, RemainingHooks}),
-                      {true, {module, Name, NewOpts}}
-              end;
-         (_) -> true
-      end,
-      Plugins).
-
-remove_module_hook({H,M,F,A}, Module, Hooks) ->
-    lists:filter(fun({H1, F1, A1}) ->
-                         {H1, Module, F1, A1} =/= {H,M,F,A};
-                    ({F1, A1}) ->
-                         {Module, Module, F1, A1} =/= {H,M,F,A};
-                    (_) -> true
-                 end,
-                 Hooks).
-
-update_plugins(Plugins, #state{config_file=ConfigFile} = State) ->
-    case load_plugins(Plugins, State) of
-        {error, Reason} ->
-            {error, Reason};
-        {ok, NewState} ->
-            ok = write_plugin_config(ConfigFile, NewState#state.plugins),
-            {ok, NewState}
-    end.
+filter_plugins(RunLevels, Plugins) ->
+    lists:filter(
+      fun({{module, _,_,_,_}, Lvl}) ->
+              lists:member(Lvl, RunLevels);
+         ({{application, _}, #{level := Lvl}}) ->
+              lists:member(Lvl, RunLevels)
+      end, Plugins).
 
 write_plugin_config(ConfigFile, Plugins) ->
     Data = io_lib:format("~p.", [{plugins, ?CONFIG_V1, Plugins}]),
@@ -475,71 +407,17 @@ read_config(ConfigFile) ->
             {error, Reason}
     end.
 
+get_level({{module, _,_,_,_}, Lvl}) ->
+    Lvl;
+get_level({{application, _}, #{level := Lvl}}) ->
+    Lvl.
 
-%% init_from_config_file(#state{ready={waiting,_Pid}} = State) ->
-%%     %% we currently wait for the registered process to become alive
-%%     {ok, State};
-%% init_from_config_file(#state{config_file=ConfigFile} = State) ->
-%%     case file:consult(ConfigFile) of
-%%         {ok, [{plugins, Plugins}]} ->
-%%             load_plugins(Plugins, State);
-%%         {ok, _} ->
-%%             {error, incorrect_plugin_config};
-%%         {error, enoent} ->
-%%             ok = write_plugin_config(ConfigFile, []),
-%%             {ok, handle_deferred_calls(State#state{ready=true})};
-%%         {error, Reason} ->
-%%             {error, Reason}
-%%     end.
-
-load_plugins(Plugins, State) ->
-    case check_plugins(Plugins, []) of
-        {ok, CheckedPlugins} ->
-            ok = init_plugins_cli(CheckedPlugins),
-            ok = start_plugins(CheckedPlugins),
-            ok = compile_hooks(CheckedPlugins),
-            {ok, handle_deferred_calls(State#state{ready=true})};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-check_plugins([{module, ModuleName, Options} = Plugin|Rest], Acc) ->
-    case check_module_plugin(ModuleName, Options) of
-        {error, Reason} ->
-            lager:warning("can't load module plugin \"~p\": ~p", [ModuleName, Reason]),
-            {error, Reason};
-         plugin_ok ->
-            check_plugins(Rest, [Plugin|Acc])
-    end;
-check_plugins([{application, App, Options}|Rest], Acc) ->
-    case check_app_plugin(App, Options) of
-        {error, Reason} ->
-            lager:warning("can't load application plugin \"~p\": ~p", [App, Reason]),
-            {error, Reason};
-        CheckedPlugin ->
-            check_plugins(Rest, [CheckedPlugin|Acc])
-    end;
-check_plugins([], CheckedHooks) ->
-    {ok, lists:reverse(CheckedHooks)}.
-
-check_module_plugin(Module, Options) ->
-    Hooks = proplists:get_value(hooks, Options, undefined),
-    check_module_hooks(Module, Hooks).
-
-check_module_hooks(Module, undefined) ->
-    {error, {no_hooks_defined_for_module, Module}};
-check_module_hooks(_, []) ->
-    plugin_ok;
-check_module_hooks(Module, [Hook|Rest]) ->
-    case check_module_hook(Module, Hook) of
-        {error, Reason} -> {error, Reason};
-        ok -> check_module_hooks(Module, Rest)
-    end.
-
-check_module_hook(Module, {_HookName, Fun, Arity}) ->
-    check_mfa(Module, Fun, Arity);
-check_module_hook(Module, {Fun, Arity}) ->
-    check_mfa(Module, Fun, Arity).
+group_plugins_by_level(Plugins) ->
+    lists:sort(
+      fun(P1, P2) ->
+              get_level(P1) >= get_level(P2)
+      end,
+      Plugins).
 
 check_mfa(Module, Fun, Arity) ->
     case catch apply(Module, module_info, [exports]) of
@@ -553,13 +431,6 @@ check_mfa(Module, Fun, Arity) ->
                     {error, {no_matching_fun_in_module, Module, Fun, Arity}}
             end
     end.
-
-start_plugins([{module, _, _}|Rest]) ->
-    start_plugins(Rest);
-start_plugins([{application, App, _}|Rest]) ->
-    start_plugin(App),
-    start_plugins(Rest);
-start_plugins([]) -> ok.
 
 start_plugin(App) ->
     case lists:keyfind(App, 1, application:which_applications()) of
@@ -589,24 +460,15 @@ start_plugin(App) ->
             ok
     end.
 
-init_plugins_cli(CheckedPlugins) ->
-    init_plugins_cli(CheckedPlugins, application:get_env(vmq_plugin, default_schema_dir, [])).
-
-init_plugins_cli([{module, _, _}|Rest], Acc) ->
-    init_plugins_cli(Rest, Acc);
-init_plugins_cli([{application, App, _}|Rest], Acc) ->
+init_plugin_cli(App) ->
     case code:priv_dir(App) of
-        {error, bad_name} ->
-            init_plugins_cli(Rest, Acc);
         PrivDir ->
-            init_plugins_cli(Rest, [PrivDir|Acc])
-    end;
-init_plugins_cli([], Acc) ->
-    case clique_config:load_schema(Acc) of
-        {error, schema_files_not_found} ->
-            lager:debug("couldn't load cuttlefish schema");
-        ok ->
-            ok
+            case clique_config:load_schema(PrivDir) of
+                {error, schema_files_not_found} ->
+                    lager:debug("couldn't load cuttlefish schema for plugin: ~p", [App]);
+                ok ->
+                    ok
+            end
     end.
 
 
@@ -629,31 +491,28 @@ stop_plugin(App) ->
     application:unload(App),
     ok.
 
-check_app_plugin(App, Options) ->
-    AppPaths = proplists:get_value(paths, Options, []),
+check_app_plugin(App, #{paths := AppPaths}) ->
     case create_paths(App, AppPaths) of
         [] ->
             lager:debug("can't create paths ~p for app ~p~n", [AppPaths, App]),
             {error, plugin_not_found};
         Paths ->
             code:add_paths(Paths),
-            load_application(App, Options)
+            load_application(App)
     end.
 
-load_application(App, Options) ->
+load_application(App) ->
     case application:load(App) of
         ok ->
             case find_mod_conflicts(App) of
                 [] ->
-                    Hooks = application:get_env(App, vmq_plugin_hooks, []),
-                    check_app_hooks(App, Hooks, Options);
+                    check_app_hooks(App);
                 [Err|_] ->
                     application:unload(App),
                     {error, {module_conflict, Err}}
             end;
         {error, {already_loaded, App}} ->
-            Hooks = application:get_env(App, vmq_plugin_hooks, []),
-            check_app_hooks(App, Hooks, Options);
+            check_app_hooks(App);
         E ->
             lager:debug("can't load application ~p", [E]),
             []
@@ -713,11 +572,11 @@ load_app_modules(App) ->
     lager:info("Loading modules: ~p", [Modules]),
     [code:load_file(M) || M <- Modules].
 
-check_app_hooks(App, Hooks, Options) ->
+check_app_hooks(App) ->
     Hooks = application:get_env(App, vmq_plugin_hooks, []),
     case check_app_hooks(App, Hooks) of
         hooks_ok ->
-            {application, App, [{hooks, Hooks}|Options]};
+            hooks_ok;
         {error, Reason} ->
             {error, Reason}
     end.
@@ -746,14 +605,10 @@ extract_hooks(CheckedPlugins) ->
 
 extract_hooks([], Acc) ->
     lists:reverse(lists:flatten(Acc));
-extract_hooks([{module, Name, Options}|Rest], Acc) ->
-    case proplists:get_value(hooks, Options, []) of
-        [] -> extract_hooks(Rest, Acc);
-        Hooks ->
-            extract_hooks(Rest, [extract_module_hooks(Name, Hooks, []) | Acc])
-    end;
-extract_hooks([{application, _Name, Options}|Rest], Acc) ->
-    case proplists:get_value(hooks, Options, []) of
+extract_hooks([{module, Name, Mod, Fun, Arity}|Rest], Acc) ->
+    extract_hooks(Rest, [{Name, Mod, Fun, Arity} | Acc]);
+extract_hooks([{application, Name}|Rest], Acc) ->
+    case application:get_env(Name, vmq_plugin_hooks, []) of
         [] -> extract_hooks(Rest, Acc);
         Hooks -> extract_hooks(Rest, [extract_app_hooks(Hooks, []) | Acc])
     end.
@@ -768,15 +623,19 @@ extract_app_hooks([{H,M,F,A}|Rest], Acc) ->
 extract_app_hooks([{H,M,F,A, Opts}|Rest], Acc) ->
     extract_app_hooks(Rest, [{H,M,F,A, Opts}|Acc]).
 
-extract_module_hooks(_, [], Acc) ->
-    Acc;
-extract_module_hooks(ModName, [{HookName, Fun, Arity}|Rest], Acc) ->
-    extract_module_hooks(ModName, Rest, [{HookName, ModName, Fun, Arity, []}|Acc]);
-extract_module_hooks(ModName, [{Fun, Arity}|Rest], Acc) ->
-    extract_module_hooks(ModName, Rest, [{Fun, ModName, Fun, Arity, []}|Acc]).
+compile_hooks(TargetLevel, Plugins) ->
+    TgtNum = proplists:get_value(TargetLevel, ?RUNLEVELS),
+    Levels =
+        lists:filter(fun({_Name, Num}) ->
+                             Num =< TgtNum
+                     end, ?RUNLEVELS),
+    FilteredPlugins =
+        filter_plugins(Levels, Plugins),
+    compile_hooks(FilteredPlugins).
 
-compile_hooks(CheckedPlugins) ->
-    RawPlugins = extract_hooks(CheckedPlugins),
+compile_hooks(Plugins) ->
+    {PluginKeys, _Opts} = lists:unzip(Plugins),
+    RawPlugins = extract_hooks(PluginKeys),
     Hooks = [{H,M,F,A} || {H,M,F,A,_} <-
                               lists:keysort(1, lists:flatten(RawPlugins))],
     M1 = smerl:new(vmq_plugin),
@@ -788,7 +647,7 @@ compile_hooks(CheckedPlugins) ->
     {ok, M4} = smerl:add_func(M3, {function, 1, all_till_ok, 2, AllTillOkClauses}),
     InfoOnlyClause = info_only_clause(OnlyInfo),
     InfoAllClause = info_all_clause(AllInfo),
-    InfoRawClause = info_raw_clause(CheckedPlugins),
+    InfoRawClause = info_raw_clause(PluginKeys),
     {ok, M5} = smerl:add_func(M4, {function, 1, info, 1, [InfoOnlyClause, InfoAllClause, InfoRawClause]}),
     smerl:compile(M5).
 
