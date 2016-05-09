@@ -15,16 +15,27 @@
 -module(vmq_plugin_mgr).
 -behaviour(gen_server).
 
+-define(CONFIG_V1, v1).
+
 %% API
 -export([start_link/0,
-         stop/0,
-         enable_plugin/1,
-         enable_plugin/2,
-         enable_module_plugin/3,
-         enable_module_plugin/4,
-         disable_plugin/1,
-         disable_module_plugin/3,
-         disable_module_plugin/4]).
+         stop/0
+         %% disable_plugin/1,
+         %% disable_module_plugin/3,
+         %% disable_module_plugin/4
+        ]).
+
+%% runlevels
+-export([goto_runlevel/1
+        ,register_module_plugin/4
+        ,register_module_plugin/5
+        %% ,unregister_module_plugin/3
+        %% ,unregister_module_plugin/4
+        ,register_app_plugin/2
+        ,register_app_plugin/3
+        %% ,unregister_app_plugin/1
+        ,dump_plugins/0
+        ]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -54,13 +65,15 @@
           ready=false,
           plugin_dir,
           config_file,
+          %% proplist of plugins, most recent added first.
+          plugins=[],
           deferred_calls=[]}).
 
--type plugin() :: atom()
-                | {atom(),
-                   atom(),
-                   atom(),
-                   non_neg_integer()}.
+%% -type plugin() :: atom()
+%%                 | {atom(),
+%%                    atom(),
+%%                    atom(),
+%%                    non_neg_integer()}.
 
 %%%===================================================================
 %%% API
@@ -81,40 +94,52 @@ stop() ->
     %% plugin are stopped...
     gen_server:call(?MODULE, stop, infinity).
 
--spec enable_plugin(atom()) -> ok | {error, _}.
-enable_plugin(Plugin) ->
-    enable_plugin(Plugin, []).
--spec enable_plugin(atom(), [string()]) -> ok | {error, _}.
-enable_plugin(Plugin, Paths) when is_atom(Plugin) and is_list(Paths) ->
-    gen_server:call(?MODULE, {enable_plugin, Plugin, [{paths, Paths}]}, infinity).
+-spec register_app_plugin(atom(), atom()) -> ok | {error, _}.
+register_app_plugin(Plugin, Level) ->
+    register_app_plugin(Plugin, [], Level).
 
--spec enable_module_plugin(atom(), atom(), non_neg_integer()) ->
-    ok | {error, _}.
-enable_module_plugin(Module, Fun, Arity) ->
-    enable_module_plugin(Fun, Module, Fun, Arity).
+-spec register_app_plugin(atom(), [string()], atom()) -> ok | {error, _}.
+register_app_plugin(Plugin, Paths, Level) when
+      is_atom(Plugin) and is_list(Paths) and is_atom(Level)  ->
+    gen_server:call(?MODULE, {register_app_plugin, Plugin,
+                              #{level => Level, paths => Paths}}, infinity).
 
--spec enable_module_plugin(atom(), atom(), atom(), non_neg_integer()) ->
+-spec register_module_plugin(atom(), atom(), non_neg_integer(), atom()) ->
     ok | {error, _}.
-enable_module_plugin(HookName, Module, Fun, Arity) when
+register_module_plugin(Module, Fun, Arity, Level) ->
+    register_module_plugin(Fun, Module, Fun, Arity, Level).
+
+-spec register_module_plugin(atom(), atom(), atom(), non_neg_integer(), atom()) ->
+    ok | {error, _}.
+register_module_plugin(HookName, Module, Fun, Arity, Level) when
       is_atom(HookName) and is_atom(Module)
-      and is_atom(Fun) and (Arity >= 0) ->
-    gen_server:call(?MODULE, {enable_module_plugin, HookName, Module, Fun, Arity}, infinity).
+      and is_atom(Fun) and (Arity >= 0) and is_atom(Level) ->
+    gen_server:call(?MODULE, {register_module_plugin, HookName, Module, Fun, Arity, Level},
+                    infinity).
 
--spec disable_module_plugin(atom(), atom(), non_neg_integer()) ->
-    ok | {error, _}.
-disable_module_plugin(Module, Fun, Arity) ->
-    disable_module_plugin(Fun, Module, Fun, Arity).
+dump_plugins() ->
+    gen_server:call(?MODULE, dump_plugins).
 
--spec disable_module_plugin(atom(), atom(), atom(), non_neg_integer()) ->
-    ok | {error, _}.
-disable_module_plugin(HookName, Module, Fun, Arity) when
-      is_atom(HookName) and is_atom(Module)
-      and is_atom(Fun) and (Arity >= 0) ->
-    disable_plugin({HookName, Module, Fun, Arity}).
+%% -spec disable_module_plugin(atom(), atom(), non_neg_integer()) ->
+%%     ok | {error, _}.
+%% disable_module_plugin(Module, Fun, Arity) ->
+%%     disable_module_plugin(Fun, Module, Fun, Arity).
 
--spec disable_plugin(plugin()) -> ok | {error, _}.
-disable_plugin(Plugin) when is_atom(Plugin) or is_tuple(Plugin) ->
-    gen_server:call(?MODULE, {disable_plugin, Plugin}, infinity).
+%% -spec disable_module_plugin(atom(), atom(), atom(), non_neg_integer()) ->
+%%     ok | {error, _}.
+%% disable_module_plugin(HookName, Module, Fun, Arity) when
+%%       is_atom(HookName) and is_atom(Module)
+%%       and is_atom(Fun) and (Arity >= 0) ->
+%%     disable_plugin({HookName, Module, Fun, Arity}).
+
+%% -spec disable_plugin(plugin()) -> ok | {error, _}.
+%% disable_plugin(Plugin) when is_atom(Plugin) or is_tuple(Plugin) ->
+%%     gen_server:call(?MODULE, {disable_plugin, Plugin}, infinity).
+
+-spec goto_runlevel(atom()) -> ok | {error, _}.
+goto_runlevel(Level) ->
+    gen_server:call(?MODULE, {goto_runlevel, Level}, infinity).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -136,8 +161,10 @@ init([]) ->
     case filelib:ensure_dir(PluginDir) of
         ok ->
             ConfigFile = filename:join(PluginDir, ConfigFileName),
-            case init_from_config_file(#state{plugin_dir=PluginDir,
-                                         config_file=ConfigFile}) of
+            Config = read_config(ConfigFile),
+            case wait_until_ready(#state{plugin_dir=PluginDir,
+                                         config_file=ConfigFile,
+                                         plugins=Config}) of
                 {ok, State} -> {ok, State};
                 {error, Reason} -> {stop, Reason}
             end;
@@ -174,6 +201,36 @@ handle_call(stop, _From, #state{config_file=ConfigFile} = State) ->
             ignore
     end,
     {reply, ok, State};
+handle_call({register_app_plugin, Plugin, Opts}, _From,
+            #state{plugins = Plugins} = State) ->
+    PluginKey = {application, Plugin},
+    case proplists:get_value(PluginKey, Plugins) of
+        undefined ->
+            NewPlugins = [{PluginKey, Opts}| Plugins],
+            write_plugin_config(State#state.config_file, NewPlugins),
+            {reply, ok, State#state{plugins = NewPlugins}};
+        _ ->
+            {reply, {error, already_registered}, State}
+    end;
+handle_call({register_module_plugin, HookName, Module, Fun, Arity, Level},
+            _From, #state{plugins = Plugins} = State) ->
+    PluginKey = {module, HookName, Module, Fun, Arity},
+    case proplists:get_value(PluginKey, Plugins) of
+        undefined ->
+            NewPlugins = [{PluginKey, Level}|Plugins],
+            write_plugin_config(State#state.config_file, NewPlugins),
+            {reply, ok, State#state{plugins = NewPlugins}};
+        _ ->
+            {reply, {error, already_registered}, State}
+    end;
+handle_call(dump_plugins, _From, #state{plugins = Plugins} = State) ->
+    {reply, Plugins, State};
+handle_call({goto_runlevel, Level}, _From, #state{ready=true} = State) ->
+    {Res, State} = goto_runlevel(Level, State),
+    {reply, Res, State};
+handle_call({goto_runlevel, _Level}, _From, State) ->
+    {reply, {error, not_ready}, State};
+
 handle_call(Call, _From, #state{ready=true} = State) ->
     handle_plugin_call(Call, State);
 handle_call(Call, From, #state{deferred_calls=DeferredCalls} = State) ->
@@ -239,10 +296,7 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_info(ready, State) ->
-    case init_from_config_file(State#state{ready=true}) of
-        {ok, NewState} -> {noreply, NewState};
-        {error, Reason} -> {stop, Reason}
-    end;
+    {ok, State#state{ready=true}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -274,6 +328,10 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+goto_runlevel(_Level, State) ->
+    {ok, State}.
+
 enable_plugin_generic(Plugin, #state{config_file=ConfigFile} = State) ->
     case file:consult(ConfigFile) of
         {ok, [{plugins, Plugins}]} ->
@@ -355,13 +413,13 @@ update_plugins(Plugins, #state{config_file=ConfigFile} = State) ->
         {error, Reason} ->
             {error, Reason};
         {ok, NewState} ->
-            ok = write_plugin_config(ConfigFile, Plugins),
+            ok = write_plugin_config(ConfigFile, NewState#state.plugins),
             {ok, NewState}
     end.
 
-write_plugin_config(ConfigFile, NewPlugins) ->
-    NewS = io_lib:format("~p.", [{plugins, NewPlugins}]),
-    ok = file:write_file(ConfigFile, NewS).
+write_plugin_config(ConfigFile, Plugins) ->
+    Data = io_lib:format("~p.", [{plugins, ?CONFIG_V1, Plugins}]),
+    ok = file:write_file(ConfigFile, Data).
 
 init_when_ready(MgrPid, RegisteredProcess) ->
     case whereis(RegisteredProcess) of
@@ -372,7 +430,7 @@ init_when_ready(MgrPid, RegisteredProcess) ->
             MgrPid ! ready
     end.
 
-init_from_config_file(#state{ready=false} = State) ->
+wait_until_ready(#state{ready=false} = State) ->
     {ok, RegisteredProcess} = application:get_env(vmq_plugin, wait_for_proc),
     %% we start initializing the plugins as soon as
     %% the registered process is alive
@@ -385,23 +443,54 @@ init_from_config_file(#state{ready=false} = State) ->
                     end),
             {ok, State#state{ready={waiting, Pid}}};
         _ ->
-            {ok, handle_deferred_calls(State#state{ready=true})}
-    end;
-init_from_config_file(#state{ready={waiting,_Pid}} = State) ->
-    %% we currently wait for the registered process to become alive
-    {ok, State};
-init_from_config_file(#state{config_file=ConfigFile} = State) ->
+            
+            {ok, State#state{ready=true}}
+    end.
+
+read_config(ConfigFile) ->
     case file:consult(ConfigFile) of
         {ok, [{plugins, Plugins}]} ->
-            load_plugins(Plugins, State);
+            %% convert old style config file to ?CONFIG_V1 style.
+            lists:map(
+              fun({application, Plugin, Opts}) ->
+                      {{application, Plugin},
+                       maps:merge(maps:from_list(Opts), #{level => system})};
+                 ({module, Module, [{hooks, [{HookName, Fun, Arity}]}]}) ->
+                      {{module, HookName, Module, Fun, Arity}, system}
+              end,
+              Plugins);
+        {ok, [{plugins, ?CONFIG_V1, Plugins}]} ->
+            lists:map(
+              fun({{application, Plugin}, Opts}) ->
+                      {{application, Plugin}, Opts};
+                 ({{module, HookName, Module, Fun, Arity}, Level}) ->
+                      {{module, HookName, Module, Fun, Arity}, Level}
+              end,
+              Plugins);
         {ok, _} ->
             {error, incorrect_plugin_config};
         {error, enoent} ->
-            ok = write_plugin_config(ConfigFile, []),
-            {ok, handle_deferred_calls(State#state{ready=true})};
+            ok = write_plugin_config(ConfigFile, []);
         {error, Reason} ->
             {error, Reason}
     end.
+
+
+%% init_from_config_file(#state{ready={waiting,_Pid}} = State) ->
+%%     %% we currently wait for the registered process to become alive
+%%     {ok, State};
+%% init_from_config_file(#state{config_file=ConfigFile} = State) ->
+%%     case file:consult(ConfigFile) of
+%%         {ok, [{plugins, Plugins}]} ->
+%%             load_plugins(Plugins, State);
+%%         {ok, _} ->
+%%             {error, incorrect_plugin_config};
+%%         {error, enoent} ->
+%%             ok = write_plugin_config(ConfigFile, []),
+%%             {ok, handle_deferred_calls(State#state{ready=true})};
+%%         {error, Reason} ->
+%%             {error, Reason}
+%%     end.
 
 load_plugins(Plugins, State) ->
     case check_plugins(Plugins, []) of
