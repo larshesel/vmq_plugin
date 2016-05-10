@@ -229,8 +229,8 @@ handle_call({register_module_plugin, HookName, Module, Fun, Arity, Level},
                 {error, Error} ->
                     {reply, {error, Error}, State}
             end;
-        _ ->
-            {reply, {error, already_registered}, State}
+        {PluginKey, Level} ->
+            {reply, ok, State}
     end;
 handle_call(dump_plugins, _From, #state{plugins = Plugins} = State) ->
     {reply, Plugins, State};
